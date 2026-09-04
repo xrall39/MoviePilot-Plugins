@@ -1,6 +1,6 @@
-import random
 import re
 from typing import Tuple
+from urllib.parse import urljoin
 
 from lxml import etree
 
@@ -14,8 +14,7 @@ from app.utils.string import StringUtils
 class Pt52(_ISiteSigninHandler):
     """
     52pt
-    如果填写openai key则调用chatgpt获取答案
-    否则随机
+    站点已改为滑块验证签到，滑块验证值由页面脚本生成
     """
     # 匹配的站点Url，每一个实现类都需要设置为自己的站点Url
     site_url = "52pt.site"
@@ -23,8 +22,11 @@ class Pt52(_ISiteSigninHandler):
     # 已签到
     _sign_regex = ['今天已经签过到了']
 
-    # 签到成功，待补充
-    _success_regex = ['\\d+点魔力值']
+    # 签到成功
+    _success_regex = ['(?:签到成功|连续签到\\s*\\d+\\s*天)，获得\\s*\\d+\\s*魔力值', '\\d+点魔力值']
+
+    # 滑块完成后页面脚本写入 sign_captcha
+    _captcha_regex = re.compile(r"captchaInput\.value\s*=\s*['\"]([^'\"]+)['\"]")
 
     @classmethod
     def match(cls, url: str) -> bool:
@@ -43,17 +45,54 @@ class Pt52(_ISiteSigninHandler):
         """
         site = site_info.get("name")
         site_cookie = site_info.get("cookie")
-        ua = site_info.get("ua")
+        ua = site_info.get("ua") or settings.NORMAL_USER_AGENT
         render = site_info.get("render")
         proxy = site_info.get("proxy")
 
-        # 判断今日是否已签到
-        html_text = self.get_page_source(url='https://52pt.site/bakatest.php',
-                                         cookie=site_cookie,
-                                         ua=ua,
-                                         proxy=proxy,
-                                         render=render)
+        # bakatest.php 仍是签到入口，但表单会指向站点当前使用的签到页面
+        entry_url = 'https://52pt.site/bakatest.php'
+        entry_html = self.get_page_source(url=entry_url,
+                                          cookie=site_cookie,
+                                          ua=ua,
+                                          proxy=proxy,
+                                          render=render)
         
+        if not entry_html:
+            logger.error(f"{site} 签到失败，请检查站点连通性")
+            return False, '签到失败，请检查站点连通性'
+
+        if "login.php" in entry_html:
+            logger.error(f"{site} 签到失败，Cookie已失效")
+            return False, '签到失败，Cookie已失效'
+
+        sign_status = self.sign_in_result(html_res=entry_html,
+                                          regexs=self._sign_regex)
+        if sign_status:
+            logger.info(f"今日已签到")
+            return True, '今日已签到'
+
+        entry_doc = etree.HTML(entry_html)
+        if entry_doc is None:
+            return False, '签到失败'
+
+        sign_link = entry_doc.xpath("//a[@id='game' or contains(., '签到赚魔力')]/@href")
+        if not sign_link:
+            logger.error(f"{site} 签到失败，未获取到签到地址")
+            return False, f"【{site}】签到失败，未获取到签到地址"
+        sign_url = urljoin(entry_url, sign_link[0])
+        if "bakatest" not in sign_url:
+            logger.info(f"今日已签到")
+            return True, '今日已签到'
+
+        # sign_token 与真实签到页绑定，需要带首页 Referer 重新获取签到页表单
+        headers = {
+            'User-Agent': ua,
+            'Cookie': site_cookie,
+            'Referer': 'https://52pt.site/index.php'
+        }
+        sign_page_res = RequestUtils(headers=headers,
+                                     proxies=settings.PROXY if proxy else None).get_res(url=sign_url)
+        html_text = sign_page_res.text if sign_page_res is not None else ''
         if not html_text:
             logger.error(f"{site} 签到失败，请检查站点连通性")
             return False, '签到失败，请检查站点连通性'
@@ -68,67 +107,68 @@ class Pt52(_ISiteSigninHandler):
             logger.info(f"今日已签到")
             return True, '今日已签到'
 
-        # 没有签到则解析html
+        # 解析滑块表单
         html = etree.HTML(html_text)
 
-        if not html:
+        if html is None:
             return False, '签到失败'
 
-        # 获取页面问题、答案
-        questionid = html.xpath("//input[@name='questionid']/@value")[0]
-        option_ids = html.xpath("//input[@name='choice[]']/@value")
-        question_str = html.xpath("//td[@class='text' and contains(text(),'请问：')]/text()")[0]
+        sign_form = html.xpath("//form[.//input[@name='sign_submit']]")
+        if not sign_form:
+            logger.error(f"{site} 签到失败，未获取到签到表单")
+            return False, f"【{site}】签到失败，未获取到签到表单"
 
-        # 正则获取问题
-        match = re.search(r'请问：(.+)', question_str)
-        if match:
-            question_str = match.group(1)
-            logger.debug(f"获取到签到问题 {question_str}")
-        else:
-            logger.error(f"未获取到签到问题")
-            return False, f"【{site}】签到失败，未获取到签到问题"
+        form = sign_form[0]
+        action = form.xpath("./@action")
+        if action:
+            sign_url = urljoin(sign_url, action[0])
+        token = form.xpath(".//input[@name='sign_token']/@value")
+        captcha = self._captcha_regex.search(html_text)
 
-        # 正确答案，默认随机，如果gpt返回则用gpt返回的答案提交
-        choice = [option_ids[random.randint(0, len(option_ids) - 1)]]
+        if not token or not captcha:
+            logger.error(f"{site} 签到失败，未获取到签到参数")
+            return False, f"【{site}】签到失败，未获取到签到参数"
 
-        # 签到
-        return self.__signin(questionid=questionid,
-                             choice=choice,
+        return self.__signin(sign_url=sign_url,
+                             sign_token=token[0],
+                             sign_captcha=captcha.group(1),
                              site_cookie=site_cookie,
                              ua=ua,
                              proxy=proxy,
                              site=site)
 
-    def __signin(self, questionid: str,
-                 choice: list,
+    def __signin(self, sign_url: str,
+                 sign_token: str,
+                 sign_captcha: str,
                  site: str,
                  site_cookie: str,
                  ua: str,
                  proxy: bool) -> Tuple[bool, str]:
         """
         签到请求
-        questionid: 450
-        choice[]: 8
-        choice[]: 4
-        usercomment: 此刻心情:无
-        submit: 提交
-        多选会有多个choice[]....
+        sign_captcha: 滑块验证值
+        sign_token: 页面令牌
+        sign_submit: 固定为1
         """
         data = {
-            'questionid': questionid,
-            'choice[]': choice[0] if len(choice) == 1 else choice,
-            'usercomment': '太难了！',
-            'wantskip': '不会'
+            'sign_captcha': sign_captcha,
+            'sign_token': sign_token,
+            'sign_submit': '1'
         }
         logger.debug(f"签到请求参数 {data}")
 
         sign_res = RequestUtils(cookies=site_cookie,
                                 ua=ua,
+                                referer=sign_url,
                                 proxies=settings.PROXY if proxy else None
-                                ).post_res(url='https://52pt.site/bakatest.php', data=data)
+                                ).post_res(url=sign_url, data=data)
         if not sign_res or sign_res.status_code != 200:
             logger.error(f"{site} 签到失败，签到接口请求失败")
             return False, '签到失败，签到接口请求失败'
+
+        if "login.php" in sign_res.text:
+            logger.error(f"{site} 签到失败，Cookie已失效")
+            return False, '签到失败，Cookie已失效'
 
         # 判断是否签到成功
         sign_status = self.sign_in_result(html_res=sign_res.text,
